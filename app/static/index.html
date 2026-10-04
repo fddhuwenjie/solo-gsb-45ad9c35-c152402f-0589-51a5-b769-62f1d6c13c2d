@@ -46,6 +46,7 @@
       <div class="mode-tabs" role="tablist">
         <button id="tab-refs" class="mode-tab active" type="button" role="tab">§ 引用重排 / 改写</button>
         <button id="tab-terms" class="mode-tab" type="button" role="tab">📖 定义术语审校</button>
+        <button id="tab-review" class="mode-tab" type="button" role="tab">✅ 逐条复核</button>
         <button id="tab-versions" class="mode-tab" type="button" role="tab">🔖 生效版本</button>
       </div>
 
@@ -148,17 +149,51 @@
       </div>
       </div>
 
-      <!-- 模式三：生效版本签发 -->
+      <!-- 模式三：逐条复核 -->
+      <div id="pane-review" class="mode-pane hidden">
+        <div class="panel review-panel">
+          <div class="panel-head">
+            <h2>逐条复核确认</h2>
+            <div class="hint">开启复核后，可按稳定条款 ID 逐条确认存活条款；确认对应保存时的正文、父级、引用目标与术语绑定。之后仅相关条款因正文 / 父级 / 绑定变化而过期，单纯编号变化不撤销确认。开启复核的草稿签发时，全部存活条款须为有效确认，且草稿修订号一致，否则整体拒绝、不产生版本</div>
+          </div>
+          <div class="review-toolbar">
+            <label class="review-switch">
+              <input type="checkbox" id="review-enabled" />
+              <span>开启逐条复核</span>
+            </label>
+            <button id="btn-review-refresh" class="btn btn-sm" type="button">刷新复核状态</button>
+            <span id="review-revision" class="issue-revision"></span>
+            <span class="review-toolbar-spacer"></span>
+            <button id="btn-review-confirm-pending" class="btn btn-primary btn-sm" type="button">
+              ✓ 确认全部待确认条款
+            </button>
+          </div>
+          <div id="review-dirty" class="review-dirty hidden">
+            ⚠ 当前有未保存修改：复核确认只对应已保存修订。请先
+            <button id="btn-review-save" class="btn btn-sm" type="button">保存草稿</button>
+            后再确认；确认按钮已暂时禁用。
+          </div>
+          <div id="review-off" class="review-off hidden">
+            本草稿尚未开启逐条复核。勾选上方「开启逐条复核」后即可按稳定条款 ID
+            逐条确认存活条款；未开启复核的草稿仍按原规则签发。
+          </div>
+          <div id="review-summary" class="review-summary"></div>
+          <div id="review-list" class="review-list"></div>
+        </div>
+      </div>
+
+      <!-- 模式四：生效版本签发 -->
       <div id="pane-versions" class="mode-pane hidden">
         <div class="panel issue-panel">
           <div class="panel-head">
             <h2>生效版本签发</h2>
-            <div class="hint">签发将一次性固定正文、顺序、删除状态与术语忽略项，重跑引用与术语终审；存在未解决问题或草稿在签发期间被修改都会被拒绝，且不改动草稿</div>
+            <div class="hint">签发将一次性固定正文、顺序、删除状态与术语忽略项，重跑引用与术语终审；存在未解决问题或草稿在签发期间被修改都会被拒绝，且不改动草稿。已开启逐条复核的草稿还须全部存活条款均为有效确认（缺失 / 过期 / 并发修改均整体拒绝，不产生版本）</div>
           </div>
           <div id="issue-actions" class="issue-actions">
             <button id="btn-issue" class="btn btn-primary" type="button">🔖 从当前草稿签发生效版本</button>
             <span id="issue-revision" class="issue-revision"></span>
           </div>
+          <div id="issue-review-hint" class="issue-review-hint hidden"></div>
           <div id="issue-blockers" class="issue-blockers hidden"></div>
           <div id="issue-success" class="issue-success hidden"></div>
         </div>

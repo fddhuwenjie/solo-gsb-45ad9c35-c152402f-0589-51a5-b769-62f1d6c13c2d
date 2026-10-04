@@ -22,6 +22,17 @@ const els = {
   tabTerms: $("#tab-terms"),
   paneRefs: $("#pane-refs"),
   paneTerms: $("#pane-terms"),
+  tabReview: $("#tab-review"),
+  paneReview: $("#pane-review"),
+  reviewEnabled: $("#review-enabled"),
+  btnReviewRefresh: $("#btn-review-refresh"),
+  reviewRevision: $("#review-revision"),
+  btnReviewConfirmPending: $("#btn-review-confirm-pending"),
+  reviewDirty: $("#review-dirty"),
+  btnReviewSave: $("#btn-review-save"),
+  reviewOff: $("#review-off"),
+  reviewSummary: $("#review-summary"),
+  reviewList: $("#review-list"),
   termIssues: $("#term-issues"),
   termDefs: $("#term-defs"),
   termIgnored: $("#term-ignored"),
@@ -79,6 +90,11 @@ const state = {
   previewResult: null,  // 最近一次预演响应
   previewStale: false,  // 正文/排序/删除变化后旧结果过期，不可确认
   previewBusy: false,
+  // 逐条复核
+  review: {
+    status: null,   // 最近一次 GET review 响应
+    busy: false,
+  },
   // 生效版本签发
   savedRevision: null,  // 服务器上当前草稿的修订号（未保存草稿为 null）
   savedSnapshot: null,  // 上次从服务器读取 / 保存成功时的快照签名（脏检查用）
@@ -291,6 +307,10 @@ async function runAnalyze(structureChanged = false) {
     invalidatePreview();
     fetchTerms();
     if (state.mode === "versions") renderIssuePanel();
+    if (state.mode === "review" && state.review.status
+        && state.review.status.enabled) {
+      renderReview();
+    }
     if (state.apply.preview) {
       renderApplyBanner(state.apply.preview);
       updateApplySummary();
@@ -1200,21 +1220,237 @@ async function switchMode(mode) {
   state.mode = mode;
   els.tabRefs.classList.toggle("active", mode === "refs");
   els.tabTerms.classList.toggle("active", mode === "terms");
+  els.tabReview.classList.toggle("active", mode === "review");
   els.tabVersions.classList.toggle("active", mode === "versions");
   els.paneRefs.classList.toggle("hidden", mode !== "refs");
   els.paneTerms.classList.toggle("hidden", mode !== "terms");
+  els.paneReview.classList.toggle("hidden", mode !== "review");
   els.paneVersions.classList.toggle("hidden", mode !== "versions");
   if (mode === "terms") {
     if (!state.terms) await fetchTerms();
     if (state.terms) renderTerms();
+  } else if (mode === "review") {
+    await fetchReview();
   } else if (mode === "versions") {
     renderIssuePanel();
+    if (state.currentDraftId
+        && (!state.review.status
+            || state.review.status.revision !== state.savedRevision)) {
+      await fetchReview({ silent: true });
+      renderIssuePanel();
+    }
     await refreshVersionList();
     if (state.activeVersion) {
       renderVersionViewer(state.activeVersion);
     } else {
       els.versionViewer.classList.add("hidden");
     }
+  }
+}
+
+// ================================================================ 逐条复核
+
+const REVIEW_STATE_META = {
+  pending: { tag: "待确认", cls: "warn" },
+  valid: { tag: "有效", cls: "ok" },
+  expired: { tag: "过期", cls: "danger" },
+  deleted: { tag: "已删除", cls: "muted" },
+};
+
+async function fetchReview({ silent = false } = {}) {
+  if (!state.currentDraftId) {
+    state.review.status = null;
+    renderReview();
+    return null;
+  }
+  state.review.busy = true;
+  try {
+    const st = await api(`/api/drafts/${state.currentDraftId}/review`);
+    state.review.status = st;
+    renderReview();
+    return st;
+  } catch (e) {
+    if (!silent) toast("复核状态读取失败：" + e.message);
+    return null;
+  } finally {
+    state.review.busy = false;
+  }
+}
+
+function reviewDirty() {
+  return !state.currentDraftId || isDraftDirty();
+}
+
+function renderReview() {
+  const st = state.review.status;
+  const hasDraft = !!state.currentDraftId;
+  const enabled = !!(st && st.enabled);
+  els.reviewOff.classList.toggle("hidden", !hasDraft || enabled);
+  els.reviewSummary.classList.toggle("hidden", !hasDraft || !enabled);
+  els.reviewList.classList.toggle("hidden", !hasDraft || !enabled);
+  els.reviewDirty.classList.toggle("hidden", !hasDraft || !enabled || !reviewDirty());
+  els.reviewEnabled.disabled = !hasDraft || state.review.busy;
+  els.btnReviewRefresh.disabled = !hasDraft || state.review.busy;
+  if (!hasDraft) els.reviewEnabled.checked = false;
+  else if (st) els.reviewEnabled.checked = enabled;
+  els.reviewOff.textContent = hasDraft
+    ? "本草稿尚未开启逐条复核。勾选上方「开启逐条复核」后即可按稳定条款 ID 逐条确认存活条款；未开启复核的草稿仍按原规则签发。"
+    : "当前内容尚未保存为草稿：请先在顶部「保存草稿」，保存后即可开启逐条复核并按稳定条款 ID 确认存活条款。";
+
+  if (!hasDraft) {
+    els.reviewRevision.textContent = "当前内容尚未保存为草稿，请先保存草稿";
+    els.btnReviewConfirmPending.disabled = true;
+    return;
+  }
+  if (!st) {
+    els.reviewRevision.textContent = "";
+    els.btnReviewConfirmPending.disabled = true;
+    return;
+  }
+  els.reviewRevision.textContent =
+    `服务器修订号 ${st.revision}` +
+    (reviewDirty() ? "（本地有未保存修改）" : "（与服务器一致）");
+
+  if (!st.enabled) {
+    els.reviewSummary.innerHTML = "";
+    els.reviewList.innerHTML = "";
+    els.btnReviewConfirmPending.disabled = true;
+    return;
+  }
+
+  const c = st.counts;
+  els.reviewSummary.innerHTML =
+    `<span class="rv-stat"><b>${st.total_alive}</b> 条存活条款</span>` +
+    `<span class="rv-stat ok">有效 <b>${c.valid}</b></span>` +
+    `<span class="rv-stat warn">待确认 <b>${c.pending}</b></span>` +
+    `<span class="rv-stat bad">过期 <b>${c.expired}</b></span>` +
+    (st.deleted_count
+      ? `<span class="rv-stat muted">已删除 <b>${st.deleted_count}</b>（恢复后须重新确认）</span>`
+      : "");
+
+  renderReviewList(st);
+  const pendingIds = st.clauses
+    .filter((x) => x.state === "pending")
+    .map((x) => x.clause_id);
+  els.btnReviewConfirmPending.disabled =
+    state.review.busy || reviewDirty() || pendingIds.length === 0;
+  els.btnReviewConfirmPending.textContent =
+    pendingIds.length
+      ? `✓ 确认全部待确认条款（${pendingIds.length} 条）`
+      : "✓ 已无待确认条款";
+}
+
+function renderReviewList(st) {
+  els.reviewList.innerHTML = "";
+  const alive = st.clauses.filter((x) => x.state !== "deleted");
+  const deleted = st.clauses.filter((x) => x.state === "deleted");
+
+  const makeRow = (c) => {
+    const meta = REVIEW_STATE_META[c.state] || REVIEW_STATE_META.pending;
+    const row = document.createElement("div");
+    row.className = `rv-row ${c.state}`;
+    const num = c.new_label || c.label || c.clause_id;
+    row.innerHTML =
+      `<span class="rv-tag ${meta.cls}">${meta.tag}</span>` +
+      `<button type="button" class="rv-clause" title="在引用重排页定位该条款">` +
+      `<b>${esc(num)}</b> ${esc(c.heading || "（无正文）")}` +
+      `<span class="rv-id">${esc(c.clause_id)}</span></button>` +
+      `<span class="rv-meta"></span>`;
+    const metaBox = row.querySelector(".rv-meta");
+    if (c.state === "valid") {
+      metaBox.textContent = c.confirmed_revision
+        ? `确认于修订 ${c.confirmed_revision}` : "已确认";
+    } else if (c.state === "expired") {
+      const reasons = (c.reason_texts || []).join("、")
+        || "正文 / 父级 / 引用目标 / 术语绑定已变化";
+      const span = document.createElement("span");
+      span.className = "rv-reasons";
+      span.textContent = "过期原因：" + reasons
+        + (c.expire_revision ? `（自修订 ${c.expire_revision} 起）` : "");
+      metaBox.appendChild(span);
+    } else {
+      metaBox.textContent = "尚未确认";
+    }
+    row.querySelector(".rv-clause").addEventListener("click", () => {
+      switchMode("refs").then(() => locate(c.clause_id));
+    });
+    if (c.state === "pending" || c.state === "expired") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-primary btn-sm rv-confirm";
+      btn.textContent = c.state === "pending" ? "确认" : "重新确认";
+      btn.disabled = reviewDirty();
+      btn.title = reviewDirty() ? "请先保存草稿再确认" : "按当前已保存修订确认该条款";
+      btn.addEventListener("click", () => confirmReview([c.clause_id]));
+      row.appendChild(btn);
+    }
+    return row;
+  };
+
+  alive.forEach((c) => els.reviewList.appendChild(makeRow(c)));
+
+  if (deleted.length) {
+    const sec = document.createElement("div");
+    sec.className = "rv-deleted-sec";
+    sec.innerHTML =
+      `<div class="rv-deleted-title">已删除条款（含级联；恢复存活后须重新确认）</div>`;
+    deleted.forEach((c) => sec.appendChild(makeRow(c)));
+    els.reviewList.appendChild(sec);
+  }
+}
+
+async function toggleReview(enabled) {
+  if (!state.currentDraftId) return;
+  state.review.busy = true;
+  try {
+    const st = await api(`/api/drafts/${state.currentDraftId}/review`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    state.review.status = st;
+    renderReview();
+    renderIssuePanel();
+    toast(enabled ? "已开启逐条复核" : "已关闭逐条复核（未开启时按原规则签发）");
+  } catch (e) {
+    toast("切换复核开关失败：" + e.message);
+    els.reviewEnabled.checked = !enabled;
+  } finally {
+    state.review.busy = false;
+  }
+}
+
+async function confirmReview(ids) {
+  if (!state.currentDraftId || state.review.busy) return;
+  const st = state.review.status;
+  if (!st) return;
+  if (reviewDirty()) {
+    toast("有未保存修改，请先保存草稿再确认");
+    return;
+  }
+  state.review.busy = true;
+  renderReview();
+  try {
+    const res = await api(
+      `/api/drafts/${state.currentDraftId}/review/confirm`, {
+        method: "POST",
+        body: JSON.stringify({ revision: st.revision, clause_ids: ids }),
+      });
+    state.review.status = res;
+    renderReview();
+    renderIssuePanel();
+    toast(`已确认 ${ids.length} 条条款（修订 ${res.revision}）`);
+  } catch (e) {
+    if (e.status === 409) {
+      const cur = e.payload && e.payload.detail && e.payload.detail.current_revision;
+      toast(`修订号已过期（服务器最新修订 ${cur ?? "?"}），正在重新载入…`);
+      await loadDraft(state.currentDraftId);
+      await fetchReview();
+    } else {
+      toast("确认失败：" + e.message);
+    }
+  } finally {
+    state.review.busy = false;
+    renderReview();
   }
 }
 
@@ -1230,6 +1466,33 @@ function renderIssuePanel() {
       (dirty ? "；有未保存修改，签发时将先保存并形成新修订号" : "；与服务器一致");
   }
   els.btnIssue.disabled = state.issueBusy;
+  renderIssueReviewHint();
+}
+
+function renderIssueReviewHint() {
+  const box = document.getElementById("issue-review-hint");
+  if (!box) return;
+  const st = state.review.status;
+  if (!state.currentDraftId || !st || !st.enabled) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  const c = st.counts;
+  const ready = c.pending === 0 && c.expired === 0;
+  box.className = "issue-review-hint " + (ready ? "ok" : "bad");
+  box.innerHTML =
+    `<span class="rv-tag ${ready ? "ok" : "warn"}">逐条复核已开启</span>` +
+    `存活 ${st.total_alive} 条 · 有效 <b>${c.valid}</b>` +
+    ` · 待确认 <b>${c.pending}</b>` +
+    ` · 过期 <b>${c.expired}</b>` +
+    (ready
+      ? " — 全部有效，可随终审一并签发"
+      : " — 存在待确认 / 过期条款，签发将被整体拒绝") +
+    ` <button type="button" class="btn btn-sm" id="issue-review-goto">前往逐条复核 →</button>`;
+  box.querySelector("#issue-review-goto").addEventListener("click",
+    () => switchMode("review"));
 }
 
 function renderBlockers(payload) {
@@ -1247,6 +1510,35 @@ function renderBlockers(payload) {
 
   const refs = blockers ? blockers.reference_issues : [];
   const terms = blockers ? blockers.term_issues : [];
+
+  // 逐条复核未完成（缺失 / 过期）
+  const review = detail && detail.review;
+  if (review) {
+    const sec = document.createElement("div");
+    sec.className = "issue-blocker-sec";
+    const missing = review.missing || [];
+    const expired = review.expired || [];
+    sec.innerHTML =
+      `<div class="issue-blocker-title">逐条复核未通过：待确认 ${missing.length} 条`
+      + ` · 已过期 ${expired.length} 条（全部存活条款须为有效确认，草稿未修改）</div>`;
+    [...expired, ...missing].forEach((c) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "issue-blocker-row review-row "
+        + (missing.includes(c) ? "pending" : "expired");
+      const tag = missing.includes(c) ? "待确认" : "过期";
+      const why = (c.reason_texts || []).length
+        ? `（${c.reason_texts.join("、")}）` : "";
+      row.innerHTML =
+        `<span class="chip-tag">${tag}</span>`
+        + `<span class="chip-msg">${esc(c.new_label || c.label || c.clause_id)}`
+        + ` ${esc(c.heading || "")}${esc(why)}</span>`
+        + `<span class="chip-goto">前往逐条复核页定位 →</span>`;
+      row.addEventListener("click", () => switchMode("review"));
+      sec.appendChild(row);
+    });
+    els.issueBlockers.appendChild(sec);
+  }
 
   if (refs.length) {
     const sec = document.createElement("div");
@@ -1331,6 +1623,7 @@ async function doIssue(retriedAfterStale) {
     renderAuditForm();
     await openVersion(res.id);
     refreshDrafts(state.currentDraftId);
+    fetchReview({ silent: true });
   } catch (e) {
     if (e.status === 422) {
       renderBlockers(e.payload);
@@ -2403,6 +2696,7 @@ async function submitApply() {
     refreshDrafts(state.currentDraftId);
     renderIssuePanel();
     await refreshVersionList();
+    await fetchReview({ silent: true });
     toast(`已应用 ${pairs.length} 条条款的勾选变更，草稿保存为修订 ${res.revision}`);
     await fetchApplyPreview();
   } catch (e) {
@@ -2501,6 +2795,7 @@ async function ensureDraftSaved() {
       state.savedRevision = r.revision;
     }
     refreshDrafts(state.currentDraftId);
+    fetchReview({ silent: true });
     return true;
   } catch (e) {
     toast("保存失败：" + e.message);
@@ -2543,6 +2838,7 @@ async function saveDraft() {
     toast("草稿已保存");
     refreshDrafts(state.currentDraftId);
     renderIssuePanel();
+    fetchReview({ silent: true });
   } catch (e) {
     toast("保存失败：" + e.message);
   }
@@ -2561,6 +2857,7 @@ async function loadDraft(id) {
   state.versionsLoadedFor = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
   state.apply = { busy: false, preview: null, selections: new Map(), seen: false };
+  state.review = { status: null, busy: false };
   els.versionViewer.classList.add("hidden");
   els.auditResult.classList.add("hidden");
   els.applyPane.classList.add("hidden");
@@ -2572,6 +2869,7 @@ async function loadDraft(id) {
   state.previewStale = false;
   els.previewPane.classList.add("hidden");
   await runAnalyze(true);
+  await fetchReview({ silent: true });
   toast(`已载入草稿：${d.title}`);
 }
 
@@ -2661,6 +2959,7 @@ function loadExample() {
   state.activeVersion = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
   state.apply = { busy: false, preview: null, selections: new Map(), seen: false };
+  state.review = { status: null, busy: false };
   state.previewSel = [];
   state.previewResult = null;
   state.previewStale = false;
@@ -2670,6 +2969,7 @@ function loadExample() {
   els.applyPane.classList.add("hidden");
   els.auditStatus.textContent = "";
   renderAuditForm();
+  renderReview();
   els.draftSelect.value = "";
   if (state.mode === "versions") renderIssuePanel();
   runAnalyze(true).then(() => {
@@ -2692,8 +2992,25 @@ els.btnExample.addEventListener("click", loadExample);
 els.btnSave.addEventListener("click", saveDraft);
 els.tabRefs.addEventListener("click", () => switchMode("refs"));
 els.tabTerms.addEventListener("click", () => switchMode("terms"));
+els.tabReview.addEventListener("click", () => switchMode("review"));
 els.tabVersions.addEventListener("click", () => switchMode("versions"));
 els.btnIssue.addEventListener("click", issueVersion);
+els.btnReviewRefresh.addEventListener("click", () => fetchReview());
+els.reviewEnabled.addEventListener("change", () =>
+  toggleReview(els.reviewEnabled.checked));
+els.btnReviewConfirmPending.addEventListener("click", () => {
+  const st = state.review.status;
+  if (!st) return;
+  const ids = st.clauses
+    .filter((x) => x.state === "pending")
+    .map((x) => x.clause_id);
+  if (ids.length) confirmReview(ids);
+});
+els.btnReviewSave.addEventListener("click", async () => {
+  await saveDraft();
+  await fetchReview();
+  renderIssuePanel();
+});
 els.btnAudit.addEventListener("click", runAudit);
 els.btnApplyFetch.addEventListener("click", fetchApplyPreview);
 els.btnApplySubmit.addEventListener("click", submitApply);
@@ -2734,6 +3051,11 @@ els.input.addEventListener("input", () => {
   if (state.previewResult) invalidatePreview();
   // 生效版本页的修订号提示同步更新（未保存修改）
   if (state.mode === "versions") renderIssuePanel();
+  // 复核页：有未保存修改时禁用确认并提示先保存
+  if (state.mode === "review" && state.review.status
+      && state.review.status.enabled) {
+    renderReview();
+  }
   // 合并应用预览：草稿变脏后旧结果标记过期，禁止提交
   if (state.apply.preview) {
     renderApplyBanner(state.apply.preview);

@@ -14,9 +14,7 @@ import hashlib
 import json
 from typing import Any
 
-from .parser import parse_contract
-from .references import analyze, cascade_deleted
-from .terms import review_terms
+from .review import build_parts
 
 
 def snapshot_fingerprint(content: str, order: list[str], deleted: list[str],
@@ -36,15 +34,10 @@ def validate_snapshot(content: str, order_in: list[str],
 
     与 /api/analyze、/api/terms 相同的入参规整：剔除解析不到的条款 id，
     删除父条款按级联展开。阻塞项中的术语问题已扣除固定忽略项。
+    解析 / 重排 / 术语审校复用逐条复核的 build_parts，两处口径保持一致。
     """
-    preamble, clauses = parse_contract(content)
-    known = {c.id for c in clauses}
-    order = [cid for cid in order_in if cid in known]
-    deleted = [cid for cid in deleted_in if cid in known]
-
-    ref_result = analyze(clauses, order, deleted)
-    deleted_set = cascade_deleted(clauses, deleted)
-    term_result = review_terms(preamble, clauses, deleted_set)
+    preamble, _clauses, ref_result, term_result, _parts = build_parts(
+        content, order_in, deleted_in)
 
     ignore_set = set(ignores)
     active_term_issues = [
