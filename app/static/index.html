@@ -46,6 +46,7 @@
       <div class="mode-tabs" role="tablist">
         <button id="tab-refs" class="mode-tab active" type="button" role="tab">§ 引用重排 / 改写</button>
         <button id="tab-terms" class="mode-tab" type="button" role="tab">📖 定义术语审校</button>
+        <button id="tab-review" class="mode-tab" type="button" role="tab">✅ 逐条复核</button>
         <button id="tab-versions" class="mode-tab" type="button" role="tab">🔖 生效版本</button>
       </div>
 
@@ -148,17 +149,39 @@
       </div>
       </div>
 
-      <!-- 模式三：生效版本签发 -->
+      <!-- 模式三：逐条复核确认 -->
+      <div id="pane-review" class="mode-pane hidden">
+        <div class="panel review-panel">
+          <div class="panel-head">
+            <h2>逐条复核确认</h2>
+            <div class="hint">开启复核后，按稳定条款 ID 逐条确认每个存活条款；确认对应<b>保存时</b>的正文、父级、引用目标与术语绑定。之后正文 / 父级变化，或重排、删除、恢复、应用版本差异使绑定改变时，仅相关条款的确认过期；单纯编号变化不撤销确认。开启复核的草稿签发前会复查全部存活条款的确认</div>
+          </div>
+          <div class="review-controls">
+            <button id="btn-review-toggle" class="btn btn-primary" type="button">开启逐条复核</button>
+            <button id="btn-review-refresh" class="btn btn-sm" type="button">刷新状态</button>
+            <span id="review-state" class="review-state"></span>
+          </div>
+          <div id="review-summary" class="review-summary"></div>
+          <div class="review-toolbar">
+            <button id="btn-review-confirm-all" class="btn btn-sm" type="button" disabled>✓ 确认全部待处理条款</button>
+            <span class="hint">确认以服务器已保存的草稿为准；有未保存修改时请先「保存草稿」</span>
+          </div>
+          <div id="review-list" class="review-list"></div>
+        </div>
+      </div>
+
+      <!-- 模式四：生效版本签发 -->
       <div id="pane-versions" class="mode-pane hidden">
         <div class="panel issue-panel">
           <div class="panel-head">
             <h2>生效版本签发</h2>
-            <div class="hint">签发将一次性固定正文、顺序、删除状态与术语忽略项，重跑引用与术语终审；存在未解决问题或草稿在签发期间被修改都会被拒绝，且不改动草稿</div>
+            <div class="hint">签发将一次性固定正文、顺序、删除状态与术语忽略项，重跑引用与术语终审；开启逐条复核的草稿还会复查全部存活条款的确认。存在未解决问题、确认缺失 / 过期或草稿在签发期间被修改都会被拒绝，且不改动草稿</div>
           </div>
           <div id="issue-actions" class="issue-actions">
             <button id="btn-issue" class="btn btn-primary" type="button">🔖 从当前草稿签发生效版本</button>
             <span id="issue-revision" class="issue-revision"></span>
           </div>
+          <div id="issue-review" class="issue-review hidden"></div>
           <div id="issue-blockers" class="issue-blockers hidden"></div>
           <div id="issue-success" class="issue-success hidden"></div>
         </div>

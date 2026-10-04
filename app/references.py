@@ -339,6 +339,12 @@ class RefMark:
     new_text: str
     status: str         # ok | unparsable | deleted | circular
     target_id: str | None = None
+    # 该处引用解析到的全部目标稳定 ID（区间展开后的完整集合，含已删除目标）；
+    # target_id 仅为首个代表目标，供旧消费方兼容使用
+    target_ids: list[str] = field(default_factory=list)
+    # 该处引用解析到的全部目标稳定 ID（区间展开后的完整集合，含已删除目标）；
+    # 供逐条复核指纹等需要完整绑定集合的消费方使用
+    target_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -449,13 +455,13 @@ def analyze(clauses: list[Clause], order: list[str],
                 if r.kind == "unparsable":
                     status, new_text = "unparsable", r.text
                     msg = f"无法解析的引用「{r.text}」"
-                    tid = None
+                    tid, tids = None, []
                 else:
                     status, new_text = "circular", r.text
                     msg = f"循环引用：{c.label} 通过「{r.text}」回到自身链条"
-                    tid = None
+                    tid, tids = None, ref_targets(r)
                 marks.append(RefMark(r.start, r.end, r.text, new_text,
-                                     status, tid))
+                                     status, tid, tids))
                 pieces.append(new_text)
                 if c.id not in deleted_set:
                     issues.append(Issue(status, c.id, r.text, msg))
@@ -468,14 +474,14 @@ def analyze(clauses: list[Clause], order: list[str],
                     status = "unparsable"  # 编号根本不存在，归入无法定位
                     msg = f"引用目标不存在：{path_label(r.a)}"
                     marks.append(RefMark(r.start, r.end, r.text, r.text,
-                                         status, None))
+                                         status, None, []))
                     if c.id not in deleted_set:
                         issues.append(Issue("unparsable", c.id, r.text, msg))
                     pieces.append(r.text)
                 elif tid in deleted_set:
                     target_label = by_id[tid].label
                     marks.append(RefMark(r.start, r.end, r.text, r.text,
-                                         "deleted", tid))
+                                         "deleted", tid, [tid]))
                     if c.id not in deleted_set:
                         issues.append(Issue(
                             "deleted", c.id, r.text,
@@ -486,7 +492,7 @@ def analyze(clauses: list[Clause], order: list[str],
                     # 单条引用 → 完整新路径
                     new_text = path_label(new_path[tid])
                     marks.append(RefMark(r.start, r.end, r.text, new_text,
-                                         "ok", tid))
+                                         "ok", tid, [tid]))
                     pieces.append(new_text)
                 cursor = r.end
                 continue
@@ -501,7 +507,8 @@ def analyze(clauses: list[Clause], order: list[str],
                 if ids and not missing:
                     labels = "、".join(by_id[t].label for t in deleted_hits)
                     marks.append(RefMark(r.start, r.end, r.text, r.text,
-                                         "deleted", deleted_hits[0]))
+                                         "deleted", deleted_hits[0],
+                                         list(ids)))
                     if c.id not in deleted_set:
                         issues.append(Issue(
                             "deleted", c.id, r.text,
@@ -510,7 +517,7 @@ def analyze(clauses: list[Clause], order: list[str],
                 else:
                     miss_labels = "、".join(path_label(p) for p in missing)
                     marks.append(RefMark(r.start, r.end, r.text, r.text,
-                                         "unparsable", None))
+                                         "unparsable", None, list(ids)))
                     if c.id not in deleted_set:
                         issues.append(Issue(
                             "unparsable", c.id, r.text,
@@ -524,7 +531,8 @@ def analyze(clauses: list[Clause], order: list[str],
                             + [path_label(p) for p in missing])
                     marks.append(RefMark(
                         r.start, r.end, r.text, new_text, "deleted",
-                        next((t for t in ids if t in deleted_set), None)))
+                        next((t for t in ids if t in deleted_set), None),
+                        list(ids)))
                     if c.id not in deleted_set:
                         issues.append(Issue(
                             "deleted", c.id, r.text,
@@ -533,7 +541,7 @@ def analyze(clauses: list[Clause], order: list[str],
                             marks[-1].target_id))
                 else:
                     marks.append(RefMark(r.start, r.end, r.text, new_text,
-                                         "ok", alive_ids[0]))
+                                         "ok", alive_ids[0], list(alive_ids)))
                 pieces.append(new_text)
             cursor = r.end
 
@@ -589,7 +597,7 @@ def _serialize(o: ClauseOut) -> dict:
             {
                 "start": m.start, "end": m.end, "text": m.text,
                 "new_text": m.new_text, "status": m.status,
-                "target_id": m.target_id,
+                "target_id": m.target_id, "target_ids": list(m.target_ids),
             } for m in o.refs
         ],
     }

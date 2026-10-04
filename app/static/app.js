@@ -40,6 +40,15 @@ const els = {
   btnCancelPreview: $("#btn-cancel-preview"),
   tabVersions: $("#tab-versions"),
   paneVersions: $("#pane-versions"),
+  tabReview: $("#tab-review"),
+  paneReview: $("#pane-review"),
+  btnReviewToggle: $("#btn-review-toggle"),
+  btnReviewRefresh: $("#btn-review-refresh"),
+  reviewState: $("#review-state"),
+  reviewSummary: $("#review-summary"),
+  btnReviewConfirmAll: $("#btn-review-confirm-all"),
+  reviewList: $("#review-list"),
+  issueReview: $("#issue-review"),
   btnIssue: $("#btn-issue"),
   issueRevision: $("#issue-revision"),
   issueBlockers: $("#issue-blockers"),
@@ -88,6 +97,14 @@ const state = {
   issueBusy: false,
   // 版本差异审计（只读不可变快照；结果缓存于前端，不随后续草稿被改而失效）
   audit: { oldId: null, newId: null, result: null, busy: false },
+  // 逐条复核确认（状态以服务器已保存的草稿修订为准）
+  review: {
+    enabled: false,   // 当前草稿是否开启逐条复核
+    items: [],        // 每个存活条款的确认状态（pending / valid / stale）
+    counts: null,     // { total, pending, valid, stale }
+    revision: null,   // 状态对应的服务器修订号
+    busy: false,
+  },
   // 应用到当前草稿（旧版基线 → 新版候选的三方合并）
   apply: {
     busy: false,          // 预览 / 提交请求进行中
@@ -291,6 +308,7 @@ async function runAnalyze(structureChanged = false) {
     invalidatePreview();
     fetchTerms();
     if (state.mode === "versions") renderIssuePanel();
+    if (state.mode === "review") renderReview();
     if (state.apply.preview) {
       renderApplyBanner(state.apply.preview);
       updateApplySummary();
@@ -1200,21 +1218,259 @@ async function switchMode(mode) {
   state.mode = mode;
   els.tabRefs.classList.toggle("active", mode === "refs");
   els.tabTerms.classList.toggle("active", mode === "terms");
+  els.tabReview.classList.toggle("active", mode === "review");
   els.tabVersions.classList.toggle("active", mode === "versions");
   els.paneRefs.classList.toggle("hidden", mode !== "refs");
   els.paneTerms.classList.toggle("hidden", mode !== "terms");
+  els.paneReview.classList.toggle("hidden", mode !== "review");
   els.paneVersions.classList.toggle("hidden", mode !== "versions");
   if (mode === "terms") {
     if (!state.terms) await fetchTerms();
     if (state.terms) renderTerms();
+  } else if (mode === "review") {
+    await fetchReview();
   } else if (mode === "versions") {
     renderIssuePanel();
+    if (state.review.enabled) fetchReview();
     await refreshVersionList();
     if (state.activeVersion) {
       renderVersionViewer(state.activeVersion);
     } else {
       els.versionViewer.classList.add("hidden");
     }
+  }
+}
+
+// ---------------------------------------------------------------- 逐条复核确认
+
+const REVIEW_STATUS_META = {
+  pending: { tag: "待确认", cls: "warn" },
+  valid: { tag: "有效", cls: "ok" },
+  stale: { tag: "已过期", cls: "danger" },
+};
+
+async function fetchReview() {
+  if (!state.currentDraftId) {
+    state.review.enabled = false;
+    state.review.items = [];
+    state.review.counts = null;
+    state.review.revision = null;
+    renderReview();
+    return;
+  }
+  try {
+    const res = await api(`/api/drafts/${state.currentDraftId}/review`);
+    state.review.enabled = !!res.enabled;
+    state.review.items = res.items || [];
+    state.review.counts = res.counts || null;
+    state.review.revision = res.revision;
+  } catch (e) {
+    state.review.items = [];
+    state.review.counts = null;
+  }
+  renderReview();
+  if (state.mode === "versions") renderIssuePanel();
+}
+
+function renderReview() {
+  const enabled = state.review.enabled;
+  const dirty = state.currentDraftId ? isDraftDirty() : true;
+  els.btnReviewToggle.textContent = enabled ? "关闭逐条复核" : "开启逐条复核";
+  els.btnReviewToggle.classList.toggle("btn-primary", !enabled);
+  els.btnReviewToggle.disabled = state.review.busy;
+
+  if (!state.currentDraftId) {
+    els.reviewState.textContent =
+      "当前内容尚未保存为草稿；开启复核时会先提示保存。";
+  } else if (!enabled) {
+    els.reviewState.textContent =
+      "该草稿未开启逐条复核；未开启的草稿仍按原规则签发。";
+  } else {
+    els.reviewState.textContent =
+      `已开启 · 服务器修订号 ${state.review.revision ?? state.savedRevision ?? "?"}` +
+      (dirty ? "；有未保存修改，确认状态以已保存修订为准，请先保存草稿"
+             : "；与服务器一致");
+  }
+
+  els.reviewList.innerHTML = "";
+  els.reviewSummary.innerHTML = "";
+  const counts = state.review.counts;
+  if (!enabled || !counts) {
+    els.btnReviewConfirmAll.disabled = true;
+    if (enabled && !counts && state.currentDraftId) {
+      const empty = document.createElement("div");
+      empty.className = "review-empty";
+      empty.textContent = "复核状态加载失败或草稿不存在，请刷新重试。";
+      els.reviewList.appendChild(empty);
+    }
+    return;
+  }
+
+  els.reviewSummary.innerHTML =
+    `<span class="rv-chip warn">待确认 <b>${counts.pending}</b></span>` +
+    `<span class="rv-chip ok">有效 <b>${counts.valid}</b></span>` +
+    `<span class="rv-chip danger">已过期 <b>${counts.stale}</b></span>` +
+    `<span class="rv-chip muted">存活条款共 <b>${counts.total}</b> 条</span>`;
+
+  const openCount = counts.pending + counts.stale;
+  els.btnReviewConfirmAll.disabled =
+    state.review.busy || openCount === 0 || dirty;
+
+  if (!state.review.items.length) {
+    const empty = document.createElement("div");
+    empty.className = "review-empty";
+    empty.textContent = "当前没有存活条款（全部已删除或尚未解析）。";
+    els.reviewList.appendChild(empty);
+    return;
+  }
+
+  state.review.items.forEach((it) => {
+    const meta = REVIEW_STATUS_META[it.status] || REVIEW_STATUS_META.pending;
+    const row = document.createElement("div");
+    row.className = `review-row ${it.status}`;
+    row.dataset.cid = it.clause_id;
+
+    const chip = document.createElement("span");
+    chip.className = `rv-status ${meta.cls}`;
+    chip.textContent = meta.tag;
+    row.appendChild(chip);
+
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "rv-main";
+    main.title = "点击在「引用重排」页定位该条款";
+    main.innerHTML =
+      `<span class="rv-label">${esc(it.new_label || it.label)}</span>` +
+      (it.new_label && it.new_label !== it.label
+        ? `<span class="rv-old">${esc(it.label)}</span>` : "") +
+      `<span class="rv-head">${esc(it.heading || "（无正文）")}</span>` +
+      (it.confirmed_at
+        ? `<span class="rv-meta">确认于 ${fmtTime(it.confirmed_at)}` +
+          `（修订 ${it.confirmed_revision}）</span>`
+        : "");
+    main.addEventListener("click", () => {
+      switchMode("refs").then(() => locate(it.clause_id));
+    });
+    row.appendChild(main);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-sm rv-confirm";
+    btn.textContent = it.status === "stale" ? "重新确认" : "确认";
+    btn.disabled = state.review.busy || dirty || it.status === "valid";
+    btn.title = dirty
+      ? "有未保存修改：确认须对应保存时的状态，请先保存草稿"
+      : (it.status === "valid"
+        ? "该条款确认当前有效"
+        : "确认该条款保存时的正文、父级、引用目标与术语绑定");
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmReview([it.clause_id]);
+    });
+    row.appendChild(btn);
+
+    els.reviewList.appendChild(row);
+  });
+}
+
+function reviewLocate(cid) {
+  const node = els.reviewList.querySelector(
+    `[data-cid="${CSS.escape(cid)}"]`);
+  if (!node) return;
+  node.scrollIntoView({ behavior: "smooth", block: "center" });
+  node.classList.remove("flash");
+  void node.offsetWidth;
+  node.classList.add("flash");
+}
+
+async function confirmReview(clauseIds) {
+  if (!state.currentDraftId || !clauseIds.length || state.review.busy) return;
+  if (isDraftDirty()) {
+    toast("有未保存修改：确认须对应保存时的状态，请先保存草稿");
+    return;
+  }
+  state.review.busy = true;
+  renderReview();
+  try {
+    const res = await api(
+      `/api/drafts/${state.currentDraftId}/review/confirm`, {
+        method: "POST",
+        body: JSON.stringify({
+          revision: state.savedRevision,
+          clause_ids: clauseIds,
+        }),
+      });
+    toast(`已确认 ${res.count} 条存活条款（对应修订号 ${res.revision}）`);
+  } catch (e) {
+    if (e.status === 409) {
+      const cur = e.payload && e.payload.detail
+        && e.payload.detail.current_revision;
+      toast(`草稿修订号已变化（服务器最新 ${cur ?? "?"}），确认未写入`);
+      if (window.confirm("草稿已被其他修改，本次确认未写入。载入服务器最新草稿？")) {
+        await loadDraft(state.currentDraftId);
+      }
+    } else {
+      toast("确认失败：" + e.message);
+    }
+  } finally {
+    state.review.busy = false;
+    await fetchReview();
+  }
+}
+
+async function confirmAllReview() {
+  const ids = state.review.items
+    .filter((it) => it.status !== "valid")
+    .map((it) => it.clause_id);
+  if (!ids.length) {
+    toast("全部存活条款的确认均已有效");
+    return;
+  }
+  await confirmReview(ids);
+}
+
+async function toggleReview() {
+  if (state.review.busy) return;
+  const enabling = !state.review.enabled;
+  if (!enabling
+      && !window.confirm("关闭逐条复核？关闭后签发不再检查逐条确认（已有确认记录保留，重新开启后仍按指纹判定）。")) {
+    return;
+  }
+  if (enabling) {
+    // 开启前须先保存草稿（确认与状态均以服务器已保存的修订为准）
+    const saved = await ensureDraftSaved();
+    if (!saved) return;
+    state.savedSnapshot = draftSnapshot();
+  }
+  state.review.busy = true;
+  renderReview();
+  try {
+    const res = await api(`/api/drafts/${state.currentDraftId}/review`, {
+      method: "POST",
+      body: JSON.stringify({
+        enabled: enabling,
+        revision: state.savedRevision,
+      }),
+    });
+    state.savedRevision = res.revision;
+    state.review.enabled = res.enabled;
+    toast(res.enabled
+      ? "已开启逐条复核：请逐条确认存活条款，签发前须全部有效"
+      : "已关闭逐条复核：签发按原规则进行");
+    refreshDrafts(state.currentDraftId);
+  } catch (e) {
+    if (e.status === 409) {
+      toast("草稿修订号已变化，操作未生效；请载入最新草稿后重试");
+      if (window.confirm("载入服务器最新草稿？")) {
+        await loadDraft(state.currentDraftId);
+      }
+    } else {
+      toast("操作失败：" + e.message);
+    }
+  } finally {
+    state.review.busy = false;
+    await fetchReview();
+    renderIssuePanel();
   }
 }
 
@@ -1228,6 +1484,28 @@ function renderIssuePanel() {
     els.issueRevision.textContent =
       `当前草稿修订号 ${state.savedRevision ?? "?"}` +
       (dirty ? "；有未保存修改，签发时将先保存并形成新修订号" : "；与服务器一致");
+  }
+  // 逐条复核摘要（仅开启复核的草稿；签发前须全部存活条款确认有效）
+  if (state.currentDraftId && state.review.enabled) {
+    els.issueReview.classList.remove("hidden");
+    const c = state.review.counts;
+    if (c) {
+      const open = c.pending + c.stale;
+      els.issueReview.className = "issue-review" +
+        (open ? " has-open" : " all-valid");
+      els.issueReview.innerHTML =
+        `逐条复核：待确认 <b>${c.pending}</b> · 有效 <b>${c.valid}</b>` +
+        ` · 已过期 <b>${c.stale}</b>（共 ${c.total} 条存活条款）` +
+        (open
+          ? `——签发前须全部确认有效，请前往「✅ 逐条复核」页签处理`
+          : `——全部存活条款确认有效`) +
+        (dirty ? "；有未保存修改，签发时将先保存，保存后相关确认可能过期" : "");
+    } else {
+      els.issueReview.className = "issue-review";
+      els.issueReview.textContent = "逐条复核已开启（状态加载中…）";
+    }
+  } else {
+    els.issueReview.classList.add("hidden");
   }
   els.btnIssue.disabled = state.issueBusy;
 }
@@ -1283,6 +1561,29 @@ function renderBlockers(payload) {
         `<span class="chip-goto">前往术语审校页定位 →</span>`;
       row.addEventListener("click", () => {
         switchMode("terms").then(() => locateTerm(it.occ_id));
+      });
+      sec.appendChild(row);
+    });
+    els.issueBlockers.appendChild(sec);
+  }
+
+  const reviewIssues = blockers ? (blockers.review_issues || []) : [];
+  if (reviewIssues.length) {
+    const sec = document.createElement("div");
+    sec.className = "issue-blocker-sec";
+    sec.innerHTML = `<div class="issue-blocker-title">逐条复核 ${reviewIssues.length} 项未通过（开启复核的草稿须全部存活条款确认有效）</div>`;
+    reviewIssues.forEach((it) => {
+      const meta = REVIEW_STATUS_META[it.status] || REVIEW_STATUS_META.pending;
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `issue-blocker-row review ${it.status}`;
+      row.innerHTML =
+        `<span class="chip-tag">${meta.tag}</span>` +
+        `<span class="chip-msg">${esc(it.new_label || it.label)}` +
+        `${it.heading ? " " + esc(it.heading) : ""}：${esc(it.message)}</span>` +
+        `<span class="chip-goto">前往逐条复核页定位 →</span>`;
+      row.addEventListener("click", () => {
+        switchMode("review").then(() => reviewLocate(it.clause_id));
       });
       sec.appendChild(row);
     });
@@ -1383,6 +1684,8 @@ async function doIssue(retriedAfterStale) {
     state.issueBusy = false;
     els.btnIssue.disabled = false;
     els.btnIssue.textContent = "🔖 从当前草稿签发生效版本";
+    // 签发尝试（无论成败）后同步逐条复核状态（保存 / 签发可能改变确认有效性）
+    if (state.review.enabled) fetchReview();
   }
 }
 
@@ -2402,6 +2705,8 @@ async function submitApply() {
     state.savedSnapshot = draftSnapshot();
     refreshDrafts(state.currentDraftId);
     renderIssuePanel();
+    // 应用版本差异改变了绑定：相关条款的确认随之过期，刷新复核状态
+    if (state.review.enabled) fetchReview();
     await refreshVersionList();
     toast(`已应用 ${pairs.length} 条条款的勾选变更，草稿保存为修订 ${res.revision}`);
     await fetchApplyPreview();
@@ -2444,6 +2749,7 @@ async function refreshDrafts(selectId) {
         `<option value="${d.id}" data-title="${esc(d.title)}">`
         + `${esc(d.title)}（修订 ${d.revision}`
         + (d.version_count ? ` / ${d.version_count} 个生效版本` : "")
+        + (d.review_enabled ? " / 逐条复核" : "")
         + "）</option>").join("");
     if (selectId) els.draftSelect.value = String(selectId);
   } catch (_) { /* 后端不可用时静默 */ }
@@ -2543,6 +2849,8 @@ async function saveDraft() {
     toast("草稿已保存");
     refreshDrafts(state.currentDraftId);
     renderIssuePanel();
+    // 保存后相关条款的确认可能过期（指纹按新保存内容重算）
+    if (state.review.enabled) fetchReview();
   } catch (e) {
     toast("保存失败：" + e.message);
   }
@@ -2557,6 +2865,10 @@ async function loadDraft(id) {
   state.termIgnores = d.term_ignores || [];
   state.savedRevision = d.revision;
   state.savedSnapshot = draftSnapshot();
+  state.review = {
+    enabled: !!d.review_enabled, items: [], counts: null,
+    revision: d.revision, busy: false,
+  };
   state.activeVersion = null;
   state.versionsLoadedFor = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
@@ -2572,6 +2884,8 @@ async function loadDraft(id) {
   state.previewStale = false;
   els.previewPane.classList.add("hidden");
   await runAnalyze(true);
+  if (state.review.enabled) await fetchReview();
+  else if (state.mode === "review") renderReview();
   toast(`已载入草稿：${d.title}`);
 }
 
@@ -2656,6 +2970,9 @@ function loadExample() {
   state.currentDraftId = null;
   state.savedRevision = null;
   state.savedSnapshot = null;
+  state.review = {
+    enabled: false, items: [], counts: null, revision: null, busy: false,
+  };
   state.versions = [];
   state.versionsLoadedFor = null;
   state.activeVersion = null;
@@ -2692,8 +3009,12 @@ els.btnExample.addEventListener("click", loadExample);
 els.btnSave.addEventListener("click", saveDraft);
 els.tabRefs.addEventListener("click", () => switchMode("refs"));
 els.tabTerms.addEventListener("click", () => switchMode("terms"));
+els.tabReview.addEventListener("click", () => switchMode("review"));
 els.tabVersions.addEventListener("click", () => switchMode("versions"));
 els.btnIssue.addEventListener("click", issueVersion);
+els.btnReviewToggle.addEventListener("click", toggleReview);
+els.btnReviewRefresh.addEventListener("click", fetchReview);
+els.btnReviewConfirmAll.addEventListener("click", confirmAllReview);
 els.btnAudit.addEventListener("click", runAudit);
 els.btnApplyFetch.addEventListener("click", fetchApplyPreview);
 els.btnApplySubmit.addEventListener("click", submitApply);
@@ -2734,6 +3055,8 @@ els.input.addEventListener("input", () => {
   if (state.previewResult) invalidatePreview();
   // 生效版本页的修订号提示同步更新（未保存修改）
   if (state.mode === "versions") renderIssuePanel();
+  // 逐条复核页的「未保存修改」提示同步更新
+  if (state.mode === "review") renderReview();
   // 合并应用预览：草稿变脏后旧结果标记过期，禁止提交
   if (state.apply.preview) {
     renderApplyBanner(state.apply.preview);

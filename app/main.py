@@ -28,6 +28,11 @@ from .merge import (
     apply_merge,
     build_apply_preview,
 )
+from .review import (
+    build_review_status,
+    clause_fingerprints,
+    review_issues,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "..", "data"))
@@ -70,6 +75,32 @@ def init_db() -> None:
                 "ALTER TABLE drafts ADD COLUMN revision "
                 "INTEGER NOT NULL DEFAULT 1"
             )
+        if "review_enabled" not in cols:
+            conn.execute(
+                "ALTER TABLE drafts ADD COLUMN review_enabled "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # 逐条复核确认：按 (draft_id, clause_id) 唯一；fingerprint 为确认时
+        # 该条款「正文 + 父级 + 引用目标 + 术语绑定」四要素的哈希（见 review.py）。
+        # 有效性靠指纹惰性比对，保存草稿 / 应用版本差异均不主动改写本表。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_confirmations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id INTEGER NOT NULL REFERENCES drafts(id),
+                clause_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                confirmed_at INTEGER NOT NULL,
+                UNIQUE(draft_id, clause_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_review_conf_draft "
+            "ON review_confirmations(draft_id)"
+        )
 
         # 生效版本：快照四要素（正文/顺序/删除/忽略）+ 签发时的编号、改写与绑定；
         # 一经写入不可修改，后续编辑只产生新版本号，不覆盖旧版本。
@@ -192,7 +223,8 @@ def review(req: TermsRequest) -> dict:
 def list_drafts() -> list[dict]:
     with db() as conn:
         rows = conn.execute(
-            "SELECT d.id, d.title, d.revision, d.created_at, d.updated_at, "
+            "SELECT d.id, d.title, d.revision, d.review_enabled, "
+            "d.created_at, d.updated_at, "
             "COUNT(v.id) AS version_count "
             "FROM drafts d LEFT JOIN versions v ON v.draft_id = d.id "
             "GROUP BY d.id ORDER BY d.updated_at DESC"
@@ -201,6 +233,7 @@ def list_drafts() -> list[dict]:
     for r in rows:
         row = dict(r)
         row["version_count"] = row.get("version_count") or 0
+        row["review_enabled"] = bool(row.get("review_enabled"))
         out.append(row)
     return out
 
@@ -231,6 +264,7 @@ def _draft_payload(row: sqlite3.Row) -> dict:
         "deleted": json.loads(row["deleted_json"]),
         "term_ignores": json.loads(row["term_ignores_json"] or "[]"),
         "revision": row["revision"],
+        "review_enabled": bool(row["review_enabled"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -272,10 +306,154 @@ def update_draft(draft_id: int, req: DraftIn) -> dict:
 def delete_draft(draft_id: int) -> dict:
     with db() as conn:
         cur = conn.execute("DELETE FROM drafts WHERE id=?", (draft_id,))
-    if cur.rowcount == 0:
-        raise HTTPException(status_code=404, detail="草稿不存在")
-    # 已签发版本保留（不可变凭证，不随草稿删除而销毁）
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        # 已签发版本保留（不可变凭证，不随草稿删除而销毁）；逐条确认随草稿删除
+        conn.execute(
+            "DELETE FROM review_confirmations WHERE draft_id=?", (draft_id,))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 逐条复核确认
+
+class ReviewToggleRequest(BaseModel):
+    # 开启 / 关闭逐条复核；乐观锁：须携带当前草稿修订号
+    enabled: bool
+    revision: int
+
+
+class ReviewConfirmRequest(BaseModel):
+    # 逐条确认提交：乐观锁修订号 + 按稳定条款 ID 的存活条款集合
+    revision: int
+    clause_ids: list[str] = Field(min_length=1)
+
+
+def _get_draft_row(conn: sqlite3.Connection, draft_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM drafts WHERE id=?", (draft_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="草稿不存在")
+    return row
+
+
+def _confirmations(conn: sqlite3.Connection, draft_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT clause_id, fingerprint, revision, confirmed_at "
+        "FROM review_confirmations WHERE draft_id=?", (draft_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/drafts/{draft_id}/review")
+def get_review(draft_id: int) -> dict:
+    """逐条复核状态：每个存活条款的 待确认 / 有效 / 过期（以已保存草稿为准）。"""
+    with db() as conn:
+        draft = _draft_payload(_get_draft_row(conn, draft_id))
+        if not draft["review_enabled"]:
+            return {"enabled": False, "revision": draft["revision"],
+                    "items": [], "counts": None}
+        confirmations = _confirmations(conn, draft_id)
+    status = build_review_status(
+        draft["content"], draft["order"], draft["deleted"], confirmations)
+    return {"enabled": True, "revision": draft["revision"], **status}
+
+
+@app.post("/api/drafts/{draft_id}/review")
+def set_review_enabled(draft_id: int, req: ReviewToggleRequest) -> dict:
+    """开启 / 关闭逐条复核（草稿级开关，保存为新修订；确认记录保留）。
+
+    修订号不符 → 409（不改动任何状态）。
+    """
+    now = int(time.time())
+    with db() as conn:
+        row = _get_draft_row(conn, draft_id)
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "SELECT revision FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()
+        if cur is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        current_rev = cur[0]
+        if current_rev != req.revision or current_rev != row["revision"]:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail={
+                "message": "草稿修订号已变化，开启 / 关闭复核未生效",
+                "current_revision": current_rev,
+            })
+        conn.execute(
+            "UPDATE drafts SET review_enabled=?, revision=revision+1, "
+            "updated_at=? WHERE id=?",
+            (1 if req.enabled else 0, now, draft_id),
+        )
+        new_rev = conn.execute(
+            "SELECT revision FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()[0]
+        conn.commit()
+    return {"ok": True, "enabled": req.enabled, "revision": new_rev}
+
+
+@app.post("/api/drafts/{draft_id}/review/confirm")
+def confirm_review(draft_id: int, req: ReviewConfirmRequest) -> dict:
+    """提交逐条复核确认。
+
+    确认绑定**保存时**的四要素指纹（正文 / 父级 / 引用目标 / 术语绑定，
+    由服务端按当前已保存草稿计算，而非客户端提交的内容）；提交须携带当前
+    草稿修订号，过期提交整体不写入（409）。
+    """
+    now = int(time.time())
+    with db() as conn:
+        draft = _draft_payload(_get_draft_row(conn, draft_id))
+        if not draft["review_enabled"]:
+            raise HTTPException(
+                status_code=400, detail="该草稿未开启逐条复核，无法提交确认")
+
+        survivors, fingerprints, labels = clause_fingerprints(
+            draft["content"], draft["order"], draft["deleted"])
+        survivor_set = set(survivors)
+        requested = list(dict.fromkeys(req.clause_ids))
+        invalid = [cid for cid in requested if cid not in survivor_set]
+        if invalid:
+            names = "、".join(invalid)
+            raise HTTPException(
+                status_code=400,
+                detail=f"以下条款不存在或已删除，无法确认：{names}")
+
+        # 加事务锁后核对修订号：过期提交不写入任何确认
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "SELECT revision FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()
+        if cur is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        current_rev = cur[0]
+        if current_rev != req.revision or current_rev != draft["revision"]:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail={
+                "message": "草稿修订号已变化，本次确认未写入；"
+                           "请载入最新草稿后重新复核",
+                "current_revision": current_rev,
+            })
+        for cid in requested:
+            conn.execute(
+                "INSERT INTO review_confirmations "
+                "(draft_id, clause_id, revision, fingerprint, confirmed_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(draft_id, clause_id) DO UPDATE SET "
+                "revision=excluded.revision, "
+                "fingerprint=excluded.fingerprint, "
+                "confirmed_at=excluded.confirmed_at",
+                (draft_id, cid, current_rev, fingerprints[cid], now),
+            )
+        conn.commit()
+    return {
+        "ok": True,
+        "revision": current_rev,
+        "confirmed": requested,
+        "count": len(requested),
+    }
 
 
 # ---------------------------------------------------------------- 生效版本签发
@@ -325,8 +503,10 @@ def issue_version(draft_id: int, req: IssueRequest) -> dict:
 
     一次操作内固定 正文 / 顺序 / 删除状态 / 术语忽略项，重跑引用与术语终审：
     - 存在无法解析 / 目标已删除 / 循环引用 / 未忽略术语问题 → 422 拒绝，草稿不变；
+    - 开启逐条复核的草稿：任一存活条款缺失确认或确认已过期 → 422 拒绝；
     - 校验期间草稿修订号已变化（乐观并发）→ 409 拒绝，不产生版本；
     - 相同快照重复提交 → 返回原版本（幂等，200 语义由 issued=false 表达）。
+    未开启逐条复核的草稿仍按原规则签发（不做逐条确认检查）。
     """
     import json
 
@@ -353,6 +533,26 @@ def issue_version(draft_id: int, req: IssueRequest) -> dict:
                 "blockers": blockers,
             })
 
+        # 1.5) 逐条复核复查（仅开启复核的草稿）：全部存活条款的确认须为有效
+        review_fp = None
+        if draft["review_enabled"]:
+            survivors, fingerprints, labels = clause_fingerprints(
+                draft["content"], draft["order"], draft["deleted"])
+            issues = review_issues(
+                survivors, fingerprints, labels,
+                _confirmations(conn, draft_id))
+            if issues:
+                raise HTTPException(status_code=422, detail={
+                    "message": f"逐条复核未通过：{len(issues)} 条存活条款"
+                               "缺失确认或确认已过期，已拒绝签发（草稿未修改）",
+                    "blockers": {
+                        "reference_issues": [],
+                        "term_issues": [],
+                        "review_issues": issues,
+                    },
+                })
+            review_fp = (survivors, fingerprints, labels)
+
         fingerprint = snapshot_fingerprint(
             draft["content"], draft["order"], draft["deleted"],
             draft["term_ignores"],
@@ -373,6 +573,25 @@ def issue_version(draft_id: int, req: IssueRequest) -> dict:
                 "message": "草稿在校验期间已被修改（修订号变化），已拒绝签发",
                 "current_revision": current_rev,
             })
+
+        # 2.5) 锁内复查逐条确认（并发确认 / 并发改动的兜底；修订号已核对，
+        #       快照即当前草稿，确认记录以锁内读取为准）
+        if review_fp is not None:
+            survivors, fingerprints, labels = review_fp
+            issues = review_issues(
+                survivors, fingerprints, labels,
+                _confirmations(conn, draft_id))
+            if issues:
+                conn.rollback()
+                raise HTTPException(status_code=422, detail={
+                    "message": f"逐条复核未通过：{len(issues)} 条存活条款"
+                               "缺失确认或确认已过期，已拒绝签发（草稿未修改）",
+                    "blockers": {
+                        "reference_issues": [],
+                        "term_issues": [],
+                        "review_issues": issues,
+                    },
+                })
 
         existing = conn.execute(
             "SELECT * FROM versions WHERE draft_id=? AND fingerprint=?",
